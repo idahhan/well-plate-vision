@@ -559,6 +559,49 @@ class TestProcessImage:
         assert math.isnan(by_well["G1"]["deltaE_to_NC"])
         assert math.isnan(by_well["G1"]["deltaE_to_PC"])
 
+    @patch("tools.spot_assay.sample_well_color_from_bbox")
+    @patch("tools.spot_assay.yolo_detect_and_assign")
+    @patch("tools.spot_assay.cv2.imread")
+    def test_per_column_reference_used(
+        self, mock_read, mock_detect, mock_sample, tmp_path
+    ):
+        """Each test well is scored against the control wells in its own column.
+
+        Column 1: PC=(50,30,20)  NC=(80,-10,3)   — test well close to PC → positive
+        Column 2: PC=(80,-10,3)  NC=(50,30,20)   — same test well is now close to NC → negative
+
+        A global row mean would blur these two distinct references together and
+        give the same call for both columns.
+        """
+        mock_read.return_value = self._dummy_img
+        mock_detect.return_value = _fake_assigned()
+
+        pc_col1 = _well_color(L=50.0, a=30.0, b=20.0)   # red-ish
+        nc_col1 = _well_color(L=80.0, a=-10.0, b=3.0)   # gray-cool
+        pc_col2 = _well_color(L=80.0, a=-10.0, b=3.0)   # same as nc_col1
+        nc_col2 = _well_color(L=50.0, a=30.0, b=20.0)   # same as pc_col1
+
+        # Test well color: close to pc_col1 / nc_col2, far from nc_col1 / pc_col2
+        test_color = _well_color(L=52.0, a=28.0, b=19.0)
+
+        overrides = {
+            "G1": pc_col1, "G2": pc_col2,
+            "F1": nc_col1, "F2": nc_col2,
+            "A1": test_color, "A2": test_color,
+        }
+        side = _build_mock_color_side_effect(
+            self.cfg, self.pc_color, self.nc_color, self.med_color, overrides
+        )
+        mock_sample.side_effect = side
+
+        _, rows = process_image(tmp_path / "p.jpg", self.model, self.cfg, 0)
+        by_well = {r["well_id"]: r for r in rows}
+
+        # A1: close to pc_col1, far from nc_col1 → positive
+        assert by_well["A1"]["call"] == "positive"
+        # A2: same color but now far from pc_col2, close to nc_col2 → negative
+        assert by_well["A2"]["call"] == "negative"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # draw_plate_grid

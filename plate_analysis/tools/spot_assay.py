@@ -331,7 +331,7 @@ def process_image(
             "experiment_status": "",   # filled in below
         }
 
-    # ── Compute control means from filled wells in control rows ───────────────
+    # ── Compute control references ────────────────────────────────────────────
     _ctrl_rows = (cfg.media_pc_row, cfg.matrix_pc_row, cfg.matrix_nc_row)
 
     pc_filled = [well_rows[f"{cfg.matrix_pc_row}{c}"]
@@ -358,16 +358,34 @@ def process_image(
             r["call"] = "control" if r["row"] in _ctrl_rows else r["call"]
         return status, list(well_rows.values())
 
-    pc_mean_lab = _mean_lab(pc_filled)
-    nc_mean_lab = _mean_lab(nc_filled)
+    # Row-wide fallback means — used for any column whose control well is not filled.
+    pc_fallback_lab = _mean_lab(pc_filled)
+    nc_fallback_lab = _mean_lab(nc_filled)
     status = "OK"
 
+    # Per-column PC and NC references.  Each test well is scored against the
+    # control wells in its own column only.  If a column's control well is not
+    # filled, the row-wide mean is used as a fallback.
+    pc_by_col: dict[str, tuple[float, float, float]] = {}
+    nc_by_col: dict[str, tuple[float, float, float]] = {}
+    for c in COL_LABELS:
+        pc_well = f"{cfg.matrix_pc_row}{c}"
+        nc_well = f"{cfg.matrix_nc_row}{c}"
+        pc_by_col[c] = (
+            _lab_from_row(well_rows[pc_well])
+            if pc_well in well_rows and well_rows[pc_well]["is_filled"]
+            else pc_fallback_lab
+        )
+        nc_by_col[c] = (
+            _lab_from_row(well_rows[nc_well])
+            if nc_well in well_rows and well_rows[nc_well]["is_filled"]
+            else nc_fallback_lab
+        )
+
     # ── NC reference sanity check ─────────────────────────────────────────────
-    # The filled NC wells, compared against their own mean, should have a small
-    # internal ΔE (within-group spread).  A high value indicates the reference
-    # was built from heterogeneous wells — likely contaminated by empty wells
-    # that slipped through the filled-detection gate.
-    nc_internal_dEs = [deltaE76(_lab_from_row(r), nc_mean_lab) for r in nc_filled]
+    # Check that NC wells are internally consistent across the row.  A high
+    # spread indicates the NC row is contaminated or heterogeneous.
+    nc_internal_dEs = [deltaE76(_lab_from_row(r), nc_fallback_lab) for r in nc_filled]
     nc_internal_mean_dE = sum(nc_internal_dEs) / len(nc_internal_dEs)
     if nc_internal_mean_dE > cfg.nc_ref_max_internal_dE:
         print(f"  [WARN] NC reference sanity FAILED: mean ΔE of NC wells vs "
@@ -384,14 +402,15 @@ def process_image(
     for well, row in well_rows.items():
         row["experiment_status"] = status
         row_label = row["row"]
+        col_label  = row["column"]
 
         if row_label in _ctrl_rows:
             row["call"] = "control"
-            # Still compute ΔE for reference
+            # Still compute ΔE for reference (each control well vs its column's refs)
             if row["is_filled"]:
                 lab = _lab_from_row(row)
-                row["deltaE_to_NC"] = round(deltaE76(lab, nc_mean_lab), 3)
-                row["deltaE_to_PC"] = round(deltaE76(lab, pc_mean_lab), 3)
+                row["deltaE_to_NC"] = round(deltaE76(lab, nc_by_col[col_label]), 3)
+                row["deltaE_to_PC"] = round(deltaE76(lab, pc_by_col[col_label]), 3)
                 row["deltaE_category"] = deltaE_category(row["deltaE_to_NC"])
             continue
 
@@ -400,8 +419,8 @@ def process_image(
             continue
 
         lab = _lab_from_row(row)
-        dE_nc = round(deltaE76(lab, nc_mean_lab), 3)
-        dE_pc = round(deltaE76(lab, pc_mean_lab), 3)
+        dE_nc = round(deltaE76(lab, nc_by_col[col_label]), 3)
+        dE_pc = round(deltaE76(lab, pc_by_col[col_label]), 3)
         row["deltaE_to_NC"] = dE_nc
         row["deltaE_to_PC"] = dE_pc
         row["deltaE_category"] = deltaE_category(dE_nc)
