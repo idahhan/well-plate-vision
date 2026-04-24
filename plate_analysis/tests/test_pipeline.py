@@ -445,9 +445,10 @@ class TestProcessImage:
         neg_close_well = "A2"
         neg_close_color = _well_color(L=70.5, a=-4.8, b=5.1)   # dE_nc < 1
 
-        # Negative: dE_nc ≥ 2.3 but closer to NC than PC
+        # Negative: dE_nc ≥ 2.3 but closer to NC than PC, and NOT darker than NC
+        # L=75 > NC L=70 so the darker_than_nc rule does not fire
         neg_far_well = "A3"
-        neg_far_color = _well_color(L=65.0, a=-3.0, b=4.0)
+        neg_far_color = _well_color(L=75.0, a=-3.0, b=4.0)
 
         test_overrides = {
             pos_well: positive_color,
@@ -558,6 +559,44 @@ class TestProcessImage:
         by_well = {r["well_id"]: r for r in rows}
         assert math.isnan(by_well["G1"]["deltaE_to_NC"])
         assert math.isnan(by_well["G1"]["deltaE_to_PC"])
+
+    @patch("tools.spot_assay.sample_well_color_from_bbox")
+    @patch("tools.spot_assay.yolo_detect_and_assign")
+    @patch("tools.spot_assay.cv2.imread")
+    def test_darker_than_nc_called_positive(
+        self, mock_read, mock_detect, mock_sample, tmp_path
+    ):
+        """A well darker than NC (lower L*) is positive even if closer to NC than PC."""
+        mock_read.return_value = self._dummy_img
+        mock_detect.return_value = _fake_assigned()
+
+        # NC: L=70  PC: L=50  Test well: L=60 — between the two, closer to NC
+        # but darker than NC (60 < 70) → should be positive
+        dark_well_color = _well_color(L=60.0, a=-4.0, b=5.0)
+        side = _build_mock_color_side_effect(
+            self.cfg, self.pc_color, self.nc_color, self.med_color,
+            {"A1": dark_well_color}
+        )
+        mock_sample.side_effect = side
+
+        _, rows = process_image(tmp_path / "p.jpg", self.model, self.cfg, 0)
+        by_well = {r["well_id"]: r for r in rows}
+
+        # Verify it IS closer to NC than PC (so without darker_than_nc it would be negative)
+        assert by_well["A1"]["deltaE_to_NC"] < by_well["A1"]["deltaE_to_PC"]
+        # But because L=60 < NC L=70 → called positive
+        assert by_well["A1"]["call"] == "positive"
+
+        # With the flag disabled, same well should be negative
+        cfg_no_darker = _cfg(darker_than_nc_is_positive=False)
+        side2 = _build_mock_color_side_effect(
+            cfg_no_darker, self.pc_color, self.nc_color, self.med_color,
+            {"A1": dark_well_color}
+        )
+        mock_sample.side_effect = side2
+        _, rows2 = process_image(tmp_path / "p2.jpg", self.model, cfg_no_darker, 0)
+        by_well2 = {r["well_id"]: r for r in rows2}
+        assert by_well2["A1"]["call"] == "negative"
 
     @patch("tools.spot_assay.sample_well_color_from_bbox")
     @patch("tools.spot_assay.yolo_detect_and_assign")

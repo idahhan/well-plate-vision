@@ -157,9 +157,12 @@ class SpotAssayConfig:
     #   Default = 2.3  (just-noticeable-difference boundary).
     min_meaningful_deltaE: float = 2.3
 
-    # Rule part 2: well must be closer to PC than to NC.
-    #   Set to False to disable this half (call only on min_meaningful_deltaE).
+    # Rule part 2: well must satisfy at least one of:
+    #   (a) closer to PC than to NC  (require_closer_to_pc=True), OR
+    #   (b) darker than NC  (darker_than_nc_is_positive=True, L* < NC L*)
+    #   Set require_closer_to_pc=False to skip this part entirely.
     require_closer_to_pc: bool = True
+    darker_than_nc_is_positive: bool = True
 
     # ── YOLO inference parameters ─────────────────────────────────────────
     conf: float = 0.20
@@ -425,11 +428,17 @@ def process_image(
         row["deltaE_to_PC"] = dE_pc
         row["deltaE_category"] = deltaE_category(dE_nc)
 
-        # Positivity rule (both parts independently configurable):
+        # Positivity rule:
         #   Part 1: shifted away from NC by at least min_meaningful_deltaE
-        #   Part 2: (if require_closer_to_pc) closer to PC than to NC
+        #   Part 2: (if require_closer_to_pc) closer to PC than NC,
+        #           OR darker than NC (L* < NC L*)
         part1 = dE_nc >= cfg.min_meaningful_deltaE
-        part2 = (dE_pc < dE_nc) if cfg.require_closer_to_pc else True
+        if cfg.require_closer_to_pc:
+            closer_to_pc   = dE_pc < dE_nc
+            darker_than_nc = cfg.darker_than_nc_is_positive and (lab[0] < nc_by_col[col_label][0])
+            part2 = closer_to_pc or darker_than_nc
+        else:
+            part2 = True
         row["call"] = "positive" if (part1 and part2) else "negative"
 
     return status, list(well_rows.values())
@@ -737,6 +746,8 @@ def main():
                         "(indicates contaminated NC reference)")
     p.add_argument("--no-require-closer-to-pc", action="store_true",
                    help="Disable the 'closer to PC than NC' positivity requirement")
+    p.add_argument("--no-darker-than-nc-positive", action="store_true",
+                   help="Disable calling wells darker than NC (lower L*) as positive")
     p.add_argument("--conf",  type=float, default=0.20,
                    help="YOLO detection confidence threshold")
     p.add_argument("--imgsz", type=int,   default=1280,
@@ -754,6 +765,7 @@ def main():
         nc_ref_max_internal_dE  = args.nc_ref_max_internal_dE,
         min_meaningful_deltaE   = args.min_meaningful_deltaE,
         require_closer_to_pc    = not args.no_require_closer_to_pc,
+        darker_than_nc_is_positive = not args.no_darker_than_nc_positive,
         conf                    = args.conf,
         imgsz                   = args.imgsz,
     )
