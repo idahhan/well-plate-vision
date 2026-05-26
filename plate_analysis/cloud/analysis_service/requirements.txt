@@ -8,3 +8,4 @@ ultralytics==8.*
 opencv-python-headless==4.*
 scipy==1.*
 numpy==1.*
+openpyxl==3.*

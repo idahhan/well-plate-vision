@@ -92,6 +92,8 @@ CSV_COLUMNS = [
     "deltaE_category",
     "call",
     "experiment_status",
+    "ref_pc_L", "ref_pc_a", "ref_pc_b",
+    "ref_nc_L", "ref_nc_a", "ref_nc_b",
 ]
 
 # ── Delta-E category labels ───────────────────────────────────────────────────
@@ -332,6 +334,8 @@ def process_image(
             "deltaE_category": "n/a",
             "call":           "ignored",
             "experiment_status": "",   # filled in below
+            "ref_pc_L": float("nan"), "ref_pc_a": float("nan"), "ref_pc_b": float("nan"),
+            "ref_nc_L": float("nan"), "ref_nc_a": float("nan"), "ref_nc_b": float("nan"),
         }
 
     # ── Compute control references ────────────────────────────────────────────
@@ -406,6 +410,16 @@ def process_image(
         row["experiment_status"] = status
         row_label = row["row"]
         col_label  = row["column"]
+
+        # Write reference L*a*b* values for this well's column
+        pc_ref = pc_by_col[col_label]
+        nc_ref = nc_by_col[col_label]
+        row["ref_pc_L"] = round(pc_ref[0], 2)
+        row["ref_pc_a"] = round(pc_ref[1], 2)
+        row["ref_pc_b"] = round(pc_ref[2], 2)
+        row["ref_nc_L"] = round(nc_ref[0], 2)
+        row["ref_nc_a"] = round(nc_ref[1], 2)
+        row["ref_nc_b"] = round(nc_ref[2], 2)
 
         if row_label in _ctrl_rows:
             row["call"] = "control"
@@ -577,6 +591,220 @@ def draw_plate_grid(
     return canvas
 
 
+# ── Bacteria-ID analysis ─────────────────────────────────────────────────────
+#
+# Layout: no PC/NC controls.  For every row independently:
+#   Reference triplicate 1 : cols 1-3   → Test triplicate 1 : cols 4-6
+#   Reference triplicate 2 : cols 7-9   → Test triplicate 2 : cols 10-12
+#
+# Classification (applied to each test triplicate):
+#   deltaE(ref, test) < min_deltaE              → "negative"   (similar colour)
+#   deltaE >= min_deltaE AND ref_L < test_L     → "positive"   (ref darker)
+#   deltaE >= min_deltaE AND ref_L >= test_L    → "invalid"    (ref lighter/equal-dark)
+#
+# Only filled wells contribute to the triplicate mean.
+# If a reference triplicate has no filled wells the test wells are "ignored".
+
+_BACT_REF1_COLS  = ["1", "2", "3"]
+_BACT_TEST1_COLS = ["4", "5", "6"]
+_BACT_REF2_COLS  = ["7", "8", "9"]
+_BACT_TEST2_COLS = ["10", "11", "12"]
+
+_BACT_POSITIVE_CLR = (0,  255,  80)   # bright green
+_BACT_NEGATIVE_CLR = (80, 80,  255)   # blue
+_BACT_INVALID_CLR  = (0,  80,  255)   # orange-red
+_BACT_REF_BORDER   = (180, 180, 180)  # light grey border for reference wells
+
+
+def bacteria_id_calls(
+    well_rows: list[dict],
+    min_deltaE: float = 2.3,
+) -> dict[str, str]:
+    """Return a per-well call dict for Bacteria-ID mode.
+
+    Keys are well_id strings (e.g. "A4").  Values are one of:
+      "reference" — reference triplicate well (cols 1-3 or 7-9)
+      "positive"  — test well, ref darker than test
+      "negative"  — test well, similar colour to ref
+      "invalid"   — test well, ref lighter than test (unexpected)
+      "ignored"   — empty or no filled reference wells available
+    """
+    by_well: dict[str, dict] = {r["well_id"]: r for r in well_rows}
+    calls: dict[str, str] = {}
+
+    def _filled_wells(row_label: str, col_labels: list[str]) -> list[dict]:
+        return [
+            by_well[f"{row_label}{c}"]
+            for c in col_labels
+            if f"{row_label}{c}" in by_well and by_well[f"{row_label}{c}"]["is_filled"]
+        ]
+
+    for rl in ROW_LABELS:
+        for ref_cols, test_cols in [
+            (_BACT_REF1_COLS, _BACT_TEST1_COLS),
+            (_BACT_REF2_COLS, _BACT_TEST2_COLS),
+        ]:
+            ref_wells  = _filled_wells(rl, ref_cols)
+            test_wells = _filled_wells(rl, test_cols)
+
+            # Mark all reference wells
+            for c in ref_cols:
+                wid = f"{rl}{c}"
+                if wid in by_well:
+                    calls[wid] = "reference" if by_well[wid]["is_filled"] else "ignored"
+
+            # Mark all test wells
+            if not ref_wells or not test_wells:
+                for c in test_cols:
+                    if f"{rl}{c}" in by_well:
+                        calls[f"{rl}{c}"] = "ignored"
+                continue
+
+            ref_lab  = _mean_lab(ref_wells)
+            test_lab = _mean_lab(test_wells)
+            dE = deltaE76(ref_lab, test_lab)
+
+            if dE < min_deltaE:
+                group_call = "negative"
+            elif ref_lab[0] < test_lab[0]:   # ref darker (lower L*)
+                group_call = "positive"
+            else:                             # ref lighter or equal
+                group_call = "invalid"
+
+            for c in test_cols:
+                wid = f"{rl}{c}"
+                if wid in by_well:
+                    calls[wid] = group_call if by_well[wid]["is_filled"] else "ignored"
+
+    return calls
+
+
+def draw_bacteria_id_grid(
+    well_rows: list[dict],
+    bact_calls: dict[str, str],
+    title: str,
+) -> np.ndarray:
+    """Render an 8×12 Bacteria-ID summary image.
+
+    Reference wells (cols 1-3, 7-9) shown with their actual colour + "REF" label.
+    Test wells (cols 4-6, 10-12) shown with actual colour + call overlay:
+      "+"  green  = positive
+      "−"  blue   = negative
+      "!"  red    = invalid
+    Empty wells shown as dark grey "·".
+    """
+    n_rows = len(ROW_LABELS)
+    n_cols = len(COL_LABELS)
+
+    img_w = _MARGIN_L + n_cols * _CELL + _MARGIN_R
+    img_h = _MARGIN_T + n_rows * _CELL + _MARGIN_B
+    canvas = np.full((img_h, img_w, 3), _BG, dtype=np.uint8)
+
+    by_well: dict[str, dict] = {r["well_id"]: r for r in well_rows}
+
+    # Column labels
+    for ci, cl in enumerate(COL_LABELS):
+        x = _MARGIN_L + ci * _CELL + _CELL // 2 - 8
+        cv2.putText(canvas, cl, (x, _MARGIN_T - 10),
+                    _FONT, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+
+    # Vertical dividers between ref/test groups
+    for divider_ci in [3, 6, 9]:   # after cols 3, 6, 9
+        dx = _MARGIN_L + divider_ci * _CELL
+        cv2.line(canvas,
+                 (dx, _MARGIN_T - 5),
+                 (dx, _MARGIN_T + n_rows * _CELL + 5),
+                 (80, 80, 80), 2)
+
+    for ri, rl in enumerate(ROW_LABELS):
+        y_top = _MARGIN_T + ri * _CELL
+
+        cv2.putText(canvas, rl, (8, y_top + _CELL // 2 + 8),
+                    _FONT, 0.65, (180, 180, 180), 1, cv2.LINE_AA)
+
+        for ci, cl in enumerate(COL_LABELS):
+            well = f"{rl}{cl}"
+            x_left = _MARGIN_L + ci * _CELL
+            x1, y1 = x_left + 2, y_top + 2
+            x2, y2 = x_left + _CELL - 2, y_top + _CELL - 2
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+            row    = by_well.get(well)
+            w_call = bact_calls.get(well, "ignored")
+            filled = row is not None and row["is_filled"]
+
+            # Cell background
+            if not filled:
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), _EMPTY_CLR, -1)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), _DEFAULT_BORDER, 1)
+                cv2.putText(canvas, "·", (cx - 4, cy + 5),
+                            _FONT, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
+                continue
+
+            R = row.get("R", 180); G = row.get("G", 180); B = row.get("B", 180)
+            cell_bgr = _EMPTY_CLR if any(math.isnan(v) for v in [R, G, B]) \
+                       else (int(B), int(G), int(R))
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), cell_bgr, -1)
+
+            # Border colour by group role
+            if cl in _BACT_REF1_COLS or cl in _BACT_REF2_COLS:
+                border_clr, border_thick = _BACT_REF_BORDER, 1
+            elif w_call == "positive":
+                border_clr, border_thick = _BACT_POSITIVE_CLR, 3
+            elif w_call == "negative":
+                border_clr, border_thick = _BACT_NEGATIVE_CLR, 3
+            elif w_call == "invalid":
+                border_clr, border_thick = _BACT_INVALID_CLR, 3
+            else:
+                border_clr, border_thick = _DEFAULT_BORDER, 1
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), border_clr, border_thick)
+
+            # Overlay label
+            if w_call == "reference":
+                cv2.putText(canvas, "REF", (cx - 18, cy + 6),
+                            _FONT, 0.38, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(canvas, "REF", (cx - 18, cy + 6),
+                            _FONT, 0.38, _BACT_REF_BORDER, 1, cv2.LINE_AA)
+            elif w_call == "positive":
+                fs = 0.9
+                tw = cv2.getTextSize("+", _FONT, fs, 2)[0][0]
+                cv2.putText(canvas, "+", (cx - tw // 2, cy + 8),
+                            _FONT, fs, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(canvas, "+", (cx - tw // 2, cy + 8),
+                            _FONT, fs, _BACT_POSITIVE_CLR, 2, cv2.LINE_AA)
+            elif w_call == "negative":
+                fs = 0.9
+                tw = cv2.getTextSize("-", _FONT, fs, 2)[0][0]
+                cv2.putText(canvas, "-", (cx - tw // 2, cy + 8),
+                            _FONT, fs, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(canvas, "-", (cx - tw // 2, cy + 8),
+                            _FONT, fs, _BACT_NEGATIVE_CLR, 2, cv2.LINE_AA)
+            elif w_call == "invalid":
+                fs = 0.8
+                tw = cv2.getTextSize("!", _FONT, fs, 2)[0][0]
+                cv2.putText(canvas, "!", (cx - tw // 2, cy + 8),
+                            _FONT, fs, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(canvas, "!", (cx - tw // 2, cy + 8),
+                            _FONT, fs, _BACT_INVALID_CLR, 2, cv2.LINE_AA)
+
+    # Title
+    cv2.putText(canvas, title, (10, 30),
+                _FONT, 0.70, (220, 220, 220), 1, cv2.LINE_AA)
+
+    # Legend
+    legend_y = img_h - 18
+    for label, clr, lx in [
+        ("REF", _BACT_REF_BORDER, 10),
+        ("+ positive", _BACT_POSITIVE_CLR, 60),
+        ("- negative", _BACT_NEGATIVE_CLR, 170),
+        ("! invalid",  _BACT_INVALID_CLR,  280),
+    ]:
+        cv2.putText(canvas, label, (lx, legend_y),
+                    _FONT, 0.42, clr, 1, cv2.LINE_AA)
+
+    return canvas
+
+
 # ── Folder-level processing ───────────────────────────────────────────────────
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
@@ -605,6 +833,87 @@ def collect_images(plates_dir: Path) -> list[Path]:
 
     imgs.sort(key=_key)
     return imgs
+
+
+def write_xlsx(csv_path: Path) -> Path:
+    """Convert well_colors.csv to an XLSX file with live Delta-E formulas.
+
+    Columns L, a, b (J/K/L) and ref_nc/pc (R-W) are written as values.
+    deltaE_to_NC (col M) and deltaE_to_PC (col N) are written as Excel
+    formulas so clicking a cell shows the CIE76 equation with its source cells.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    xlsx_path = csv_path.with_suffix(".xlsx")
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    # Column letter mapping (1-based Excel columns)
+    col_idx = {name: i + 1 for i, name in enumerate(CSV_COLUMNS)}
+
+    def col_letter(name: str) -> str:
+        from openpyxl.utils import get_column_letter
+        return get_column_letter(col_idx[name])
+
+    L_col   = col_letter("L")
+    a_col   = col_letter("a")
+    b_col   = col_letter("b")
+    pcL_col = col_letter("ref_pc_L")
+    pca_col = col_letter("ref_pc_a")
+    pcb_col = col_letter("ref_pc_b")
+    ncL_col = col_letter("ref_nc_L")
+    nca_col = col_letter("ref_nc_a")
+    ncb_col = col_letter("ref_nc_b")
+    denc_col = col_letter("deltaE_to_NC")
+    depc_col = col_letter("deltaE_to_PC")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "well_colors"
+
+    # Header row
+    header_fill = PatternFill("solid", fgColor="2F4F8F")
+    header_font = Font(bold=True, color="FFFFFF")
+    ws.append(CSV_COLUMNS)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Data rows
+    for r_idx, row in enumerate(rows, start=2):
+        for col_name in CSV_COLUMNS:
+            col_num = col_idx[col_name]
+            raw = row.get(col_name, "")
+
+            if col_name == "deltaE_to_NC" and row.get("is_filled") == "True":
+                # CIE76: sqrt((L-nc_L)^2 + (a-nc_a)^2 + (b-nc_b)^2)
+                ws.cell(row=r_idx, column=col_num,
+                        value=f"=SQRT(({L_col}{r_idx}-{ncL_col}{r_idx})^2"
+                              f"+({a_col}{r_idx}-{nca_col}{r_idx})^2"
+                              f"+({b_col}{r_idx}-{ncb_col}{r_idx})^2)")
+            elif col_name == "deltaE_to_PC" and row.get("is_filled") == "True":
+                ws.cell(row=r_idx, column=col_num,
+                        value=f"=SQRT(({L_col}{r_idx}-{pcL_col}{r_idx})^2"
+                              f"+({a_col}{r_idx}-{pca_col}{r_idx})^2"
+                              f"+({b_col}{r_idx}-{pcb_col}{r_idx})^2)")
+            else:
+                # Try to store as number if possible
+                try:
+                    ws.cell(row=r_idx, column=col_num, value=float(raw))
+                except (ValueError, TypeError):
+                    ws.cell(row=r_idx, column=col_num, value=raw)
+
+    # Auto-width columns
+    for col_cells in ws.columns:
+        max_len = max((len(str(c.value)) for c in col_cells if c.value), default=10)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
+
+    wb.save(xlsx_path)
+    return xlsx_path
 
 
 def already_processed(csv_path: Path) -> set[str]:
@@ -663,6 +972,7 @@ def process_folder(
             writer.writeheader()
 
         last_grid_path: Optional[Path] = None
+        last_bact_grid_path: Optional[Path] = None
 
         ref_stem = images[0].stem if images else None
         for idx, img_path in enumerate(to_process):
@@ -700,13 +1010,29 @@ def process_folder(
             print(f"  Grid → {grid_path}")
             last_grid_path = grid_path
 
+            # ── Bacteria-ID grid ─────────────────────────────────────────────
+            bact_calls = bacteria_id_calls(well_rows, min_deltaE=cfg.min_meaningful_deltaE)
+            bact_img   = draw_bacteria_id_grid(well_rows, bact_calls, title)
+            bact_path  = grids_dir / f"{img_path.stem}_bacteria_id.png"
+            cv2.imwrite(str(bact_path), bact_img)
+            last_bact_grid_path = bact_path
+
         # ── latest_summary.png ────────────────────────────────────────────────
         if last_grid_path is not None:
             summary_path = out_dir / "latest_summary.png"
             shutil.copy2(str(last_grid_path), str(summary_path))
             print(f"\nlatest_summary.png → {summary_path}")
 
+        if last_bact_grid_path is not None:
+            bact_summary_path = out_dir / "latest_summary_bacteria_id.png"
+            shutil.copy2(str(last_bact_grid_path), str(bact_summary_path))
+            print(f"latest_summary_bacteria_id.png → {bact_summary_path}")
+
     print(f"\nCSV  → {csv_path}")
+
+    xlsx_path = write_xlsx(csv_path)
+    print(f"XLSX → {xlsx_path}")
+
     print(f"Done.")
 
 

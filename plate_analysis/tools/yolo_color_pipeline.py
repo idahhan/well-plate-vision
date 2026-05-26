@@ -107,6 +107,17 @@ def yolo_detect_and_assign(
     D = cdist(pts, pts); np.fill_diagonal(D, np.inf)
     nn_d = D.min(axis=1)
     pitch_est = float(np.median(nn_d[nn_d < np.percentile(nn_d, 80)]))
+
+    # ── Reject isolated stray detections outside the plate ───────────────────
+    # Any detection whose nearest neighbour is more than 1.5× pitch away
+    # is not part of the well grid and will corrupt the KDE peak positions.
+    inlier_mask = nn_d < pitch_est * 1.5
+    if inlier_mask.sum() < 90:
+        # If rejection is too aggressive, fall back to keeping all points
+        inlier_mask = nn_d < pitch_est * 3.0
+    pts        = pts[inlier_mask]
+    detections = [d for d, keep in zip(detections, inlier_mask) if keep]
+
     bw = pitch_est * KDE_BW_FRAC
 
     def peaks1d(values, n_min, n_want, bw):
